@@ -3,13 +3,13 @@
 整體流程（每次都從所有 Excel 重新計算，不讀回舊資料，所以可重複執行）：
     python crawler.py                 # 下載 → data/manifest.json、data/excel/
     python processor.py               # 解析、驗證 → data/tax_records.csv、data/validation.json
-    python update_sheets.py           # 整張覆蓋寫入 Google 試算表
+    python update_sheets.py           # 僅替換收到的年月，保留其他歷史資料
 
 手動備援（財政部擋 GitHub 主機時）：
     把四張 Excel 放進 data/inbox/，然後
     python processor.py --from-dir data/inbox
 
-輸出長表每一列 ＝ 某年月、某張表、某個稅目。欄位定義見 docs/資料字典.md。
+輸出長表每一列 ＝ 某年月、某張表、某個稅目。只存當月、累計、全年預算三個核心金額；其餘分析留給儀表板。
 """
 
 import argparse
@@ -48,50 +48,22 @@ MEMO_ITEMS = {("6820", "房地合一課徵所得稅")}
 # 加總檢查容許的四捨五入誤差（百萬元）
 TOLERANCE_MILLION = Decimal("5")
 
+# 長表只保留三個跨月穩定的金額欄位（百萬元換算為億元）；
+# 其餘均為資料識別、父子結構、是否可加總與來源追溯所需的中繼資料。
 COLUMNS = [
-    "資料鍵",
-    "年度",
-    "月份",
-    "來源表",
-    "視角",
-    "政府別",
-    "稅目",
-    "稅目路徑",
-    "父項目",
-    "層級",
-    "列型態",
-    "計入加總",
-    "當月實徵_億元",
-    "累計實徵_億元",
-    "全年預算_億元",
-    "當月較上年同月增減_億元",
-    "當月較上年同月增減率_%",
-    "當月占分配預算比率_%",
-    "累計較上年同期增減_億元",
-    "累計較上年同期增減率_%",
-    "累計占分配預算比率_%",
-    "累計占全年預算比率_%",
-    "預算版本",
-    "財劃法版本",
-    "來源列",
-    "新聞網址",
-    "Excel網址",
+    "資料鍵", "年度", "月份", "來源表", "視角", "政府別",
+    "稅目", "稅目路徑", "父項目", "層級", "列型態", "計入加總",
+    "當月實徵_億元", "累計實徵_億元", "全年預算_億元",
+    "預算版本", "來源列", "新聞網址", "Excel網址",
 ]
 
-# 金額欄（百萬元 → 億元）與比率欄（原樣保留）
-YI_FIELDS = {
-    "month": "當月實徵_億元",
-    "cum": "累計實徵_億元",
-    "budget": "全年預算_億元",
-    "month_diff": "當月較上年同月增減_億元",
-    "cum_diff": "累計較上年同期增減_億元",
-}
-RATE_FIELDS = {
-    "month_rate": "當月較上年同月增減率_%",
-    "month_alloc": "當月占分配預算比率_%",
-    "cum_rate": "累計較上年同期增減率_%",
-    "cum_alloc": "累計占分配預算比率_%",
-    "cum_budget": "累計占全年預算比率_%",
+# 財政部固定四表的核心儲存格位置，字母 A=0。
+# 114/12 的年度表頭不同，但這三個欄位位置相同。
+CORE_COLS = {
+    "6820": {"month": 2, "cum": 6, "budget": 11},
+    "6900": {"month": 1, "cum": 5, "budget": 10},
+    "6920": {"month": 1, "cum": 5, "budget": 10},
+    "6951": {"month": 2, "cum": 6, "budget": 11},
 }
 
 
@@ -205,9 +177,6 @@ def to_yi(million):
     return str((million / Decimal(100)).quantize(Decimal("0.01")))
 
 
-def rate_text(value):
-    return "" if value is None else str(value)
-
 
 # ======================================
 # 3. 表頭定位（版面改變時明確報錯）
@@ -220,53 +189,27 @@ def _header_text(cells, col):
     )
 
 
-def locate_columns(cells, label):
-    found = {}
+def locate_columns(cells, label, code):
+    """只定位四張表每月一致的當月、累計和全年預算。
 
-    for (row, col), value in cells.items():
-        if row > 6:
-            continue
-        text = re.sub(r"\s+", "", value)
-        if text.startswith("本月實徵淨額"):
-            found["m"] = col
-        elif text.startswith("本年度累計實徵淨額"):
-            found["c"] = col
-        elif text.startswith("本年度預算數"):
-            found["b"] = col
-
-    if set(found) != {"m", "c", "b"}:
-        raise ValueError(f"{label} 找不到「本月／累計／預算數」表頭，可能改版")
-
-    m, c, b = found["m"], found["c"], found["b"]
-
-    if c - m != 4 or b - c != 5:
-        raise ValueError(f"{label} 欄位間距與預期不同，可能改版")
-
-    expected = {
-        m + 1: "較上年同月增減數",
-        m + 2: "較上年同月增減率",
-        m + 3: "占本月分配預算數比率",
-        c + 1: "較上年同期增減數",
-        c + 2: "較上年同期增減率",
-        c + 3: "占累計分配預算數比率",
-        c + 4: "占本年度預算數比率",
+    114 年 12 月的欄名「本年度實徵淨額」視為年末累計；
+    其餘月份的「本年度累計實徵淨額」也是同一個累計欄位。
+    只對三個核心表頭檢查，不要求年增率、分配預算等附屬欄位。
+    """
+    cols = CORE_COLS[code]
+    labels = {
+        "month": ("本月實徵淨額",),
+        "cum": ("本年度累計實徵淨額", "本年度實徵淨額"),
+        "budget": ("本年度預算數",),
     }
-    for col, word in expected.items():
-        if word not in _header_text(cells, col):
-            raise ValueError(f"{label} 第 {col + 1} 欄表頭不是「{word}」，可能改版")
-
-    return {
-        "month": m,
-        "month_diff": m + 1,
-        "month_rate": m + 2,
-        "month_alloc": m + 3,
-        "cum": c,
-        "cum_diff": c + 1,
-        "cum_rate": c + 2,
-        "cum_alloc": c + 3,
-        "cum_budget": c + 4,
-        "budget": b,
-    }
+    for key, col in cols.items():
+        text = _header_text(cells, col)
+        if not any(expected in text for expected in labels[key]):
+            raise ValueError(
+                f"{label} 核心欄 {key}（Excel 第 {col + 1} 欄）表頭不符：{text!r}；"
+                "暫停匯入以免抓錯金額"
+            )
+    return cols.copy()
 
 
 def find_period(cells):
@@ -288,6 +231,18 @@ def _indent(raw):
     return len(raw) - len(raw.lstrip(" \t　"))
 
 
+def _is_decimal_or_missing(value):
+    if value is None:
+        return True
+    v = str(value).strip().replace(",", "")
+    if not v or re.fullmatch(r"[-–—－…]+", v):
+        return True
+    try:
+        return Decimal(v).is_finite()
+    except InvalidOperation:
+        return False
+
+
 def parse_table(code, path, year, month):
     label = f"{year}{month:02d} 表{code}"
     cells = read_cells(path)
@@ -296,7 +251,7 @@ def parse_table(code, path, year, month):
     if period != (year, month):
         raise ValueError(f"{label} 檔案內的期間是 {period}，與預期不符")
 
-    cols = locate_columns(cells, label)
+    cols = locate_columns(cells, label, code)
 
     by_row = defaultdict(dict)
     for (row, col), value in cells.items():
@@ -318,7 +273,13 @@ def parse_table(code, path, year, month):
         raw_label = str(by_row[row].get(0, ""))
         name = clean_name(raw_label)
 
-        if name.startswith("說明"):
+        # 官方說明可能在表格下方拆成多行，其中 C/D 欄會出現
+        # 「百萬元，累計1-1月實物抵繳金額共為」之類文字，不能當金額。
+        # 優先判斷整列是否為附註，而非嘗試把註解欄位轉成 Decimal。
+        if (
+            name.startswith(("說明", "備註", "附註", "資料來源"))
+            or re.match(r"^(?:\(?\d+\)?[.、：:]|[註注][：:])", name)
+        ):
             in_notes = True
 
         if in_notes:
@@ -328,8 +289,29 @@ def parse_table(code, path, year, month):
         if not name:
             continue
 
+        # 欄位中含文字但整列又不像稅目：
+        # 114 年 1 月附表可能把跨欄說明拆入數值欄。
+        # 僅跳過可明確判別為註記的列；真正稅目數字格式錯誤仍會報錯。
+        numeric_values = [
+            by_row[row].get(col) for col in cols.values() if col is not None
+        ]
+        note_words = ("百萬元", "實物抵繳", "共為", "撥入金融業特別準備金施行")
+        if (
+            len(raw_rows) >= 5
+            and (any(w in name for w in note_words)
+                 or any(
+                     isinstance(v, str)
+                     and any(w in v for w in note_words)
+                     and not _is_decimal_or_missing(v)
+                     for v in numeric_values
+                 ))
+        ):
+            in_notes = True
+            notes.extend(str(v) for v in by_row[row].values())
+            continue
+
         amounts = {
-            key: parse_amount(by_row[row].get(col))
+            key: parse_amount(by_row[row].get(col)) if col is not None else None
             for key, col in cols.items()
         }
 
@@ -534,7 +516,6 @@ def parse_month(entry):
     check, warnings = check_month(year, month, tables)
 
     version = budget_version("\n".join(notes))
-    law = "新版(115年起)" if year >= 115 else "舊版"
 
     records = []
 
@@ -556,15 +537,13 @@ def parse_month(entry):
                 "列型態": rec["kind"],
                 "計入加總": "TRUE" if rec["include"] else "FALSE",
                 "預算版本": version,
-                "財劃法版本": law,
                 "來源列": rec["src_row"],
                 "新聞網址": entry.get("news_url", ""),
                 "Excel網址": files[code].get("url", ""),
             }
-            for key, column in YI_FIELDS.items():
-                out[column] = to_yi(rec[key])
-            for key, column in RATE_FIELDS.items():
-                out[column] = rate_text(rec[key])
+            out["當月實徵_億元"] = to_yi(rec["month"])
+            out["累計實徵_億元"] = to_yi(rec["cum"])
+            out["全年預算_億元"] = to_yi(rec["budget"])
             records.append(out)
 
     check["record_count"] = len(records)
