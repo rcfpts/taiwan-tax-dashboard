@@ -6,6 +6,10 @@
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch, MagicMock
+
+import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -108,6 +112,35 @@ class CrawlerTest(unittest.TestCase):
         article = {"year": 115, "month": 9, "news_url": "https://example.test/n"}
         with self.assertRaises(RuntimeError):
             crawler.find_excel_links(Session(), article)
+
+    def test_connection_drop_retries_month_then_succeeds(self):
+        article = {"year": 115, "month": 3, "news_url": "https://example.test/n"}
+        downloads = [requests.exceptions.ConnectionError("RemoteDisconnected"),
+                     requests.exceptions.ConnectionError("RemoteDisconnected"),
+                     {"6820": {"path": "ok.xlsx"}}]
+        with TemporaryDirectory() as tmp, \
+             patch.object(crawler, "find_articles", return_value={(115, 3): article}), \
+             patch.object(crawler, "make_session", return_value=MagicMock()), \
+             patch.object(crawler, "download_month", side_effect=downloads) as dl, \
+             patch.object(crawler.time, "sleep") as sleep:
+            manifest = crawler.run(output_dir=tmp)
+        self.assertEqual(manifest["months"][0]["status"], "success")
+        self.assertEqual(dl.call_count, 3)
+        self.assertEqual(sleep.call_count, 3)  # 兩次重試等待與月份間等待
+
+    def test_connection_drop_exhausted_keeps_error_manifest(self):
+        article = {"year": 115, "month": 3, "news_url": "https://example.test/n"}
+        with TemporaryDirectory() as tmp, \
+             patch.object(crawler, "find_articles", return_value={(115, 3): article}), \
+             patch.object(crawler, "make_session", return_value=MagicMock()), \
+             patch.object(crawler, "download_month", side_effect=requests.exceptions.ConnectionError("offline")) as dl, \
+             patch.object(crawler.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "最新年度部分月份下載失敗"):
+                crawler.run(output_dir=tmp)
+            import json
+            data = json.loads((Path(tmp) / "manifest.json").read_text())
+        self.assertEqual(data["months"][0]["status"], "failed")
+        self.assertEqual(dl.call_count, 4)
 
 
 if __name__ == "__main__":
