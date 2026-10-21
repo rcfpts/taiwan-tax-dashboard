@@ -103,23 +103,23 @@ class ProcessorTest(unittest.TestCase):
 
     # ---------- 欄位內容 ----------
 
-    def test_yoy_and_ratios_kept(self):
+    def test_only_core_amounts_retained(self):
         total = self.rows("6820")[0]
-        self.assertEqual(total["累計較上年同期增減_億元"], "7003.84")
-        self.assertEqual(total["累計較上年同期增減率_%"], "24.4")
-        self.assertEqual(Decimal(total["累計占分配預算比率_%"]), Decimal("115.0"))
+        self.assertEqual(total["當月實徵_億元"], "4964.64")
+        self.assertEqual(total["累計實徵_億元"], "35713.84")
         self.assertEqual(total["全年預算_億元"], "45298.76")
+        self.assertEqual(len(processor.COLUMNS), 19)
+        self.assertFalse(any("增減率" in c or "分配預算" in c for c in processor.COLUMNS))
 
     def test_dash_is_empty_not_error(self):
         self.assertIsNone(processor.parse_amount("      --"))
         self.assertIsNone(processor.parse_amount(""))
         self.assertEqual(processor.parse_amount("-4.9"), Decimal("-4.9"))
-        row = self.find("6820", "營業稅/金融業營業稅(撥入金融業特別準備金)")
-        self.assertEqual(row["當月較上年同月增減率_%"], "")
+        self.assertEqual(self.find("6820", "所得稅")["全年預算_億元"], "23379.44")
 
-    def test_budget_version_and_law_version(self):
+    def test_budget_version(self):
         self.assertEqual(self.check["budget_version"], "依法定數")
-        self.assertTrue(all(r["財劃法版本"] == "新版(115年起)" for r in self.records))
+        self.assertTrue(all(r["預算版本"] == "依法定數" for r in self.records))
 
     # ---------- 輸入 ----------
 
