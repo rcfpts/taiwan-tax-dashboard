@@ -1,685 +1,734 @@
+"""財政部月度賦稅 Excel：解析、驗證、輸出長表。
 
-"""財政部月度賦稅 Excel：整理及驗證。
+整體流程（每次都從所有 Excel 重新計算，不讀回舊資料，所以可重複執行）：
+    python crawler.py                 # 下載 → data/manifest.json、data/excel/
+    python processor.py               # 解析、驗證 → data/tax_records.csv、data/validation.json
+    python update_sheets.py           # 整張覆蓋寫入 Google 試算表
 
-執行：
-    python crawler.py
-    python processor.py
+手動備援（財政部擋 GitHub 主機時）：
+    把四張 Excel 放進 data/inbox/，然後
+    python processor.py --from-dir data/inbox
 
-讀取：
-    data/manifest.json
-    data/excel/<年月>/<代碼>_<年月>.xlsx
-
-輸出：
-    data/tax_records.csv
-    data/validation.json
+輸出長表每一列 ＝ 某年月、某張表、某個稅目。欄位定義見 docs/資料字典.md。
 """
 
 import argparse
 import csv
 import json
 import re
+import sys
 import zipfile
-
+from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-NS = {
-    "x": (
-        "http://schemas.openxmlformats.org/"
-        "spreadsheetml/2006/main"
-    )
-}
+NS = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
-# 表碼：統計視角、當月欄、累計欄、預算欄
+# 表碼：(統計視角, 政府別)；政府別為 None 者由第一層項目決定
 TABLES = {
-    "6820": ("全國稅目", "C", "G", "L"),
-    "6900": ("政府歸屬", "B", "F", "K"),
-    "6920": ("中央稅目", "B", "F", "K"),
-    "6951": ("地方稅目（含統籌）", "C", "G", "L"),
+    "6820": ("全國稅目", "全國"),
+    "6900": ("政府歸屬", None),
+    "6920": ("中央稅目", "中央"),
+    "6951": ("地方稅目（含統籌）", "地方"),
 }
 
-OWNERS = (
-    "中央政府",
-    "地方政府(含中央統籌)",
-    "撥入中央特種基金",
-)
+GOV_OF_NAME = {
+    "中央政府": "中央",
+    "地方政府(含中央統籌)": "地方",
+    "撥入中央特種基金": "基金",
+}
+
+# 「其中項」：金額已包含在其他稅目內，不可再與其他稅目相加。
+# 房地合一課徵所得稅已含在營利事業所得稅與綜合所得稅內。
+# 若財政部改變表格結構，下方的「可加總列合計 ＝ 總計」檢查會失敗並停止。
+MEMO_ITEMS = {("6820", "房地合一課徵所得稅")}
+
+# 加總檢查容許的四捨五入誤差（百萬元）
+TOLERANCE_MILLION = Decimal("5")
 
 COLUMNS = [
     "資料鍵",
     "年度",
     "月份",
     "來源表",
-    "統計視角",
-    "來源列",
-    "項目",
-    "原始項目",
-    "項目型態",
+    "視角",
+    "政府別",
+    "稅目",
+    "稅目路徑",
+    "父項目",
+    "層級",
+    "列型態",
+    "計入加總",
     "當月實徵_億元",
     "累計實徵_億元",
     "全年預算_億元",
+    "當月較上年同月增減_億元",
+    "當月較上年同月增減率_%",
+    "當月占分配預算比率_%",
+    "累計較上年同期增減_億元",
+    "累計較上年同期增減率_%",
+    "累計占分配預算比率_%",
+    "累計占全年預算比率_%",
+    "預算版本",
+    "財劃法版本",
+    "來源列",
     "新聞網址",
     "Excel網址",
 ]
 
+# 金額欄（百萬元 → 億元）與比率欄（原樣保留）
+YI_FIELDS = {
+    "month": "當月實徵_億元",
+    "cum": "累計實徵_億元",
+    "budget": "全年預算_億元",
+    "month_diff": "當月較上年同月增減_億元",
+    "cum_diff": "累計較上年同期增減_億元",
+}
+RATE_FIELDS = {
+    "month_rate": "當月較上年同月增減率_%",
+    "month_alloc": "當月占分配預算比率_%",
+    "cum_rate": "累計較上年同期增減率_%",
+    "cum_alloc": "累計占分配預算比率_%",
+    "cum_budget": "累計占全年預算比率_%",
+}
+
 
 # ======================================
-# 1. 讀取 XLSX 儲存格
+# 1. 讀取 XLSX（只用標準函式庫）
 # ======================================
+
+def _si_text(si):
+    parts = [t.text or "" for t in si.findall("x:t", NS)]
+    for run in si.findall("x:r", NS):
+        parts += [t.text or "" for t in run.findall("x:t", NS)]
+    return "".join(parts)
+
+
+def _col_index(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
 
 def read_cells(filename):
+    """回傳 {(列號, 欄索引從0起): 文字}。"""
 
     filename = Path(filename)
 
-    if (
-        not filename.is_file()
-        or not zipfile.is_zipfile(filename)
-    ):
-        raise ValueError(
-            f"Excel 不存在或格式無效：{filename}"
-        )
+    if not filename.is_file() or not zipfile.is_zipfile(filename):
+        raise ValueError(f"Excel 不存在或格式無效：{filename}")
 
     with zipfile.ZipFile(filename) as z:
+        names = z.namelist()
 
         shared = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            shared = [_si_text(si) for si in root.findall("x:si", NS)]
 
-        if "xl/sharedStrings.xml" in z.namelist():
-
-            node = ET.fromstring(
-                z.read("xl/sharedStrings.xml")
-            )
-
-            shared = [
-                "".join(
-                    text.text or ""
-                    for text in si.findall(
-                        ".//x:t", NS
-                    )
-                )
-                for si in node.findall("x:si", NS)
-            ]
-
-        first_sheet = (
-            "xl/worksheets/sheet1.xml"
+        sheets = sorted(
+            n for n in names
+            if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)
         )
+        if not sheets:
+            raise ValueError(f"{filename.name} 沒有工作表")
 
-        if first_sheet not in z.namelist():
-            raise ValueError(
-                f"{filename.name} 缺少第一張工作表"
-            )
-
-        root = ET.fromstring(
-            z.read(first_sheet)
-        )
+        root = ET.fromstring(z.read(sheets[0]))
 
         cells = {}
-
-        for cell in root.findall(
-            ".//x:sheetData/x:row/x:c", NS
-        ):
-
-            match = re.fullmatch(
-                r"([A-Z]+)(\d+)",
-                cell.get("r", "")
-            )
-
+        for cell in root.findall(".//x:sheetData/x:row/x:c", NS):
+            match = re.fullmatch(r"([A-Z]+)(\d+)", cell.get("r", ""))
             if not match:
                 continue
 
+            kind = cell.get("t")
             value = cell.find("x:v", NS)
             inline = cell.find("x:is", NS)
 
-            if (
-                value is not None
-                and value.text is not None
-            ):
-
-                if cell.get("t") == "s":
-                    text = shared[int(value.text)]
-                else:
-                    text = value.text
-
-            elif inline is not None:
-
-                text = "".join(
-                    t.text or ""
-                    for t in inline.findall(
-                        ".//x:t", NS
-                    )
-                )
-
+            if kind == "inlineStr" and inline is not None:
+                text = _si_text(inline)
+            elif value is not None and value.text is not None:
+                text = shared[int(value.text)] if kind == "s" else value.text
             else:
                 continue
 
-            cells[(
-                int(match.group(2)),
-                match.group(1)
-            )] = text
+            cells[(int(match.group(2)), _col_index(match.group(1)))] = text
 
         return cells
 
 
 # ======================================
-# 2. 清理項目名稱
+# 2. 名稱與數值清理
 # ======================================
 
-def item_name(text):
-
-    return re.sub(
-        r"\s+",
-        "",
-        str(text or "")
-    )
+_FOOTNOTE = re.compile(r"\(\d+\)$")
 
 
-# ======================================
-# 3. 金額轉換：百萬元 → 億元
-# ======================================
+def clean_name(text):
+    """去掉所有空白（含全形）、統一括號、移除結尾腳註符號 (2)。"""
 
-def amount_yi(raw):
+    s = re.sub(r"\s+", "", str(text or ""))
+    s = s.replace("（", "(").replace("）", ")")
+    return _FOOTNOTE.sub("", s)
 
-    if (
-        raw is None
-        or str(raw).strip()
-        in ("", "-", "—", "…")
-    ):
+
+def parse_amount(raw):
+    """回傳 Decimal 或 None。財政部以 -- 表示無資料。"""
+
+    if raw is None:
+        return None
+
+    text = str(raw).strip().replace(",", "")
+
+    if text == "" or re.fullmatch(r"[-–—－…]+", text):
         return None
 
     try:
-
-        number = Decimal(
-            str(raw).strip().replace(",", "")
-        )
-
-        if not number.is_finite():
-            raise ValueError(
-                f"非有限數值：{raw}"
-            )
-
-        return (
-            number / Decimal("100")
-        ).quantize(
-            Decimal("0.01")
-        )
-
+        number = Decimal(text)
     except InvalidOperation:
+        raise ValueError(f"無法解析數值：{raw!r}") from None
 
-        raise ValueError(
-            f"無法解析金額：{raw!r}"
-        ) from None
+    if not number.is_finite():
+        raise ValueError(f"非有限數值：{raw!r}")
+
+    return number
+
+
+def to_yi(million):
+    """百萬元 → 億元（精確到 0.01，無損）。"""
+
+    if million is None:
+        return ""
+    return str((million / Decimal(100)).quantize(Decimal("0.01")))
+
+
+def rate_text(value):
+    return "" if value is None else str(value)
 
 
 # ======================================
-# 4. 處理單一月份
+# 3. 表頭定位（版面改變時明確報錯）
 # ======================================
 
-def parse_month(entry):
+def _header_text(cells, col):
+    return "".join(
+        re.sub(r"\s+", "", cells.get((r, col), ""))
+        for r in range(0, 7)
+    )
 
-    year = int(entry["year"])
-    month = int(entry["month"])
+
+def locate_columns(cells, label):
+    found = {}
+
+    for (row, col), value in cells.items():
+        if row > 6:
+            continue
+        text = re.sub(r"\s+", "", value)
+        if text.startswith("本月實徵淨額"):
+            found["m"] = col
+        elif text.startswith("本年度累計實徵淨額"):
+            found["c"] = col
+        elif text.startswith("本年度預算數"):
+            found["b"] = col
+
+    if set(found) != {"m", "c", "b"}:
+        raise ValueError(f"{label} 找不到「本月／累計／預算數」表頭，可能改版")
+
+    m, c, b = found["m"], found["c"], found["b"]
+
+    if c - m != 4 or b - c != 5:
+        raise ValueError(f"{label} 欄位間距與預期不同，可能改版")
+
+    expected = {
+        m + 1: "較上年同月增減數",
+        m + 2: "較上年同月增減率",
+        m + 3: "占本月分配預算數比率",
+        c + 1: "較上年同期增減數",
+        c + 2: "較上年同期增減率",
+        c + 3: "占累計分配預算數比率",
+        c + 4: "占本年度預算數比率",
+    }
+    for col, word in expected.items():
+        if word not in _header_text(cells, col):
+            raise ValueError(f"{label} 第 {col + 1} 欄表頭不是「{word}」，可能改版")
+
+    return {
+        "month": m,
+        "month_diff": m + 1,
+        "month_rate": m + 2,
+        "month_alloc": m + 3,
+        "cum": c,
+        "cum_diff": c + 1,
+        "cum_rate": c + 2,
+        "cum_alloc": c + 3,
+        "cum_budget": c + 4,
+        "budget": b,
+    }
+
+
+def find_period(cells):
+    for (row, _col), value in sorted(cells.items()):
+        if row > 4:
+            continue
+        match = re.search(r"(\d{2,3})年\s*(\d{1,2})月", value)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+# ======================================
+# 4. 解析單一張表
+# ======================================
+
+def _indent(raw):
+    raw = str(raw)
+    return len(raw) - len(raw.lstrip(" \t　"))
+
+
+def parse_table(code, path, year, month):
+    label = f"{year}{month:02d} 表{code}"
+    cells = read_cells(path)
+
+    period = find_period(cells)
+    if period != (year, month):
+        raise ValueError(f"{label} 檔案內的期間是 {period}，與預期不符")
+
+    cols = locate_columns(cells, label)
+
+    by_row = defaultdict(dict)
+    for (row, col), value in cells.items():
+        by_row[row][col] = value
+
+    start = next(
+        (r for r in sorted(by_row)
+         if clean_name(by_row[r].get(0, "")) == "總計"),
+        None,
+    )
+    if start is None:
+        raise ValueError(f"{label} 找不到「總計」列")
+
+    raw_rows = []
+    notes = []
+    in_notes = False
+
+    for row in sorted(r for r in by_row if r >= start):
+        raw_label = str(by_row[row].get(0, ""))
+        name = clean_name(raw_label)
+
+        if name.startswith("說明"):
+            in_notes = True
+
+        if in_notes:
+            notes.extend(str(v) for v in by_row[row].values())
+            continue
+
+        if not name:
+            continue
+
+        amounts = {
+            key: parse_amount(by_row[row].get(col))
+            for key, col in cols.items()
+        }
+
+        if all(amounts[k] is None for k in ("month", "cum", "budget")):
+            continue
+
+        raw_rows.append({
+            "src_row": row,
+            "name": name,
+            "indent": _indent(raw_label),
+            **amounts,
+        })
+
+    if not raw_rows or raw_rows[0]["name"] != "總計":
+        raise ValueError(f"{label} 第一筆資料不是總計")
+
+    rows = _build_hierarchy(code, raw_rows)
+
+    paths = [r["path"] for r in rows]
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"{label} 稅目路徑重複")
+
+    return rows, "\n".join(notes)
+
+
+def _build_hierarchy(code, raw_rows):
+    """以官方排版縮排判斷層級，並標出哪些列可以加總。"""
+
+    total, items = raw_rows[0], raw_rows[1:]
+    view, fixed_gov = TABLES[code]
+
+    total.update(
+        level=0, parent=None, path="總計", parent_name="",
+        has_children=False, kind="總計", include=False, gov="全國",
+    )
+
+    if not items:
+        return [total]
+
+    base = min(r["indent"] for r in items)
+    stack = []
+
+    for rec in items:
+        level = rec["indent"] - base + 1
+
+        while stack and stack[-1]["level"] >= level:
+            stack.pop()
+
+        parent = stack[-1] if stack else None
+        rec.update(
+            level=level,
+            parent=parent,
+            parent_name=parent["name"] if parent else "",
+            path=(parent["path"] + "/" if parent else "") + rec["name"],
+            has_children=False,
+        )
+        if parent:
+            parent["has_children"] = True
+        stack.append(rec)
+
+    for rec in items:
+        top = rec
+        while top["parent"]:
+            top = top["parent"]
+
+        rec["gov"] = fixed_gov or GOV_OF_NAME.get(top["name"], "")
+
+        memo = False
+        node = rec
+        while node:
+            if (code, node["name"]) in MEMO_ITEMS:
+                memo = True
+            node = node["parent"]
+
+        own_memo = (code, rec["name"]) in MEMO_ITEMS
+
+        if own_memo:
+            rec["kind"] = "其中項"
+        elif memo:
+            rec["kind"] = "其中項明細"
+        elif rec["has_children"]:
+            rec["kind"] = "小計"
+        else:
+            rec["kind"] = "明細"
+
+        rec["include"] = rec["kind"] == "明細"
+
+    return [total] + items
+
+
+# ======================================
+# 5. 單月驗證
+# ======================================
+
+def _close(a, b):
+    return a is not None and b is not None and abs(a - b) <= TOLERANCE_MILLION
+
+
+def check_month(year, month, tables):
+    """回傳 (check, warnings)；發現錯誤時丟出 ValueError。"""
 
     ym = f"{year}{month:02d}"
+    problems = []
+    warnings = []
 
-    if entry.get("status") != "success":
-        raise ValueError(
-            f"{ym} 下載狀態不是 success"
+    def total(code):
+        return tables[code][0]
+
+    def owner(name):
+        return next(
+            r for r in tables["6900"]
+            if r["level"] == 1 and r["name"] == name
         )
 
-    files = entry.get("files", {})
+    try:
+        owners = {name: owner(name) for name in GOV_OF_NAME}
+    except StopIteration:
+        raise ValueError(f"{ym} 6900 缺少中央／地方／基金三大類") from None
 
-    if set(files) != set(TABLES):
-        raise ValueError(
-            f"{ym} 四表不足或代碼不符："
-            f"{sorted(files)}"
-        )
+    for key, label in (("month", "當月"), ("cum", "累計")):
 
-    records = []
-    totals = {}
-    owners = {}
+        national = total("6820")[key]
 
-    # 分別整理四張 Excel
-    for code, config in TABLES.items():
+        if national != total("6900")[key]:
+            problems.append(f"{label}全國總計：表 6820 與 6900 不一致")
 
-        view, mon_col, cum_col, budget_col = (
-            config
-        )
+        if total("6920")[key] != owners["中央政府"][key]:
+            problems.append(f"{label}中央總計：表 6920 與 6900 不一致")
 
-        info = files[code]
-        path = Path(info["path"])
+        if total("6951")[key] != owners["地方政府(含中央統籌)"][key]:
+            problems.append(f"{label}地方總計：表 6951 與 6900 不一致")
 
-        expected = f"{code}_{ym}.xlsx"
-
-        if path.name != expected:
-            raise ValueError(
-                f"{ym} 來源檔案命名不符："
-                f"{path.name}"
+        gov_sum = sum(o[key] for o in owners.values())
+        if not _close(gov_sum, national):
+            problems.append(
+                f"{label}中央＋地方＋基金 {gov_sum} 與全國 {national} 差異過大"
             )
 
-        values = read_cells(path)
-
-        count = 0
-
-        for row in range(7, 150):
-
-            raw_name = str(
-                values.get((row, "A"), "")
+        # 可加總列合計必須等於各表總計（抓出重複計算或漏列）
+        for code, rows in tables.items():
+            leaf_sum = sum(
+                (r[key] or Decimal(0)) for r in rows if r["include"]
             )
-
-            name = item_name(raw_name)
-
-            if name.startswith("說明"):
-                break
-
-            if not name:
-                continue
-
-            monthly = amount_yi(
-                values.get((row, mon_col))
-            )
-
-            cumulative = amount_yi(
-                values.get((row, cum_col))
-            )
-
-            budget = amount_yi(
-                values.get((row, budget_col))
-            )
-
-            if all(
-                x is None
-                for x in (
-                    monthly,
-                    cumulative,
-                    budget
-                )
-            ):
-                continue
-
-            count += 1
-
-            records.append({
-                "資料鍵":
-                    f"{ym}-{code}-{row}",
-                "年度": year,
-                "月份": month,
-                "來源表": code,
-                "統計視角": view,
-                "來源列": row,
-                "項目": name,
-                "原始項目": raw_name,
-                "項目型態": (
-                    "官方總計"
-                    if name == "總計"
-                    else "明細或小計"
-                ),
-                "當月實徵_億元": monthly,
-                "累計實徵_億元": cumulative,
-                "全年預算_億元": budget,
-                "新聞網址": entry["news_url"],
-                "Excel網址": info["url"],
-            })
-
-            # 記錄官方總計
-            if name == "總計":
-
-                if (
-                    monthly is None
-                    or cumulative is None
-                ):
-                    raise ValueError(
-                        f"{ym} {code} "
-                        "總計金額缺漏"
-                    )
-
-                totals[code] = (
-                    monthly,
-                    cumulative
+            if not _close(leaf_sum, rows[0][key]):
+                problems.append(
+                    f"表 {code} {label}：可加總列合計 {leaf_sum} "
+                    f"≠ 總計 {rows[0][key]}（百萬元）"
                 )
 
-            # 記錄政府歸屬三大類
-            if (
-                code == "6900"
-                and name in OWNERS
-            ):
-
-                if (
-                    monthly is None
-                    or cumulative is None
-                ):
-                    raise ValueError(
-                        f"{ym} 政府別金額缺漏："
-                        f"{name}"
-                    )
-
-                owners[name] = (
-                    monthly,
-                    cumulative
-                )
-
-        if count < 5:
-            raise ValueError(
-                f"{ym} {code} "
-                f"有效資料不足：僅 {count} 筆"
-            )
-
-    # ======================================
-    # 5. 核對官方總計
-    # ======================================
-
-    if set(totals) != set(TABLES):
-        raise ValueError(
-            f"{ym} 缺少四表官方總計"
+    for code, rows in tables.items():
+        leaf_budget = sum(
+            (r["budget"] or Decimal(0)) for r in rows if r["include"]
         )
-
-    if set(owners) != set(OWNERS):
-        raise ValueError(
-            f"{ym} 缺少政府別三大分類"
-        )
-
-    # 0 = 當月，1 = 累計
-    for index, label in (
-        (0, "當月"),
-        (1, "累計")
-    ):
-
-        national = totals["6820"][index]
-
-        if (
-            national
-            != totals["6900"][index]
-        ):
-            raise ValueError(
-                f"{ym} {label}全國總計："
-                "6820 與 6900 不一致"
+        if not _close(leaf_budget, rows[0]["budget"]):
+            warnings.append(
+                f"{ym} 表 {code} 全年預算：可加總列合計 {leaf_budget} "
+                f"≠ 總計 {rows[0]['budget']}（百萬元）"
             )
 
-        if (
-            totals["6920"][index]
-            != owners[OWNERS[0]][index]
-        ):
-            raise ValueError(
-                f"{ym} {label}中央總計"
-                "與 6900 不一致"
-            )
-
-        if (
-            totals["6951"][index]
-            != owners[OWNERS[1]][index]
-        ):
-            raise ValueError(
-                f"{ym} {label}地方總計"
-                "與 6900 不一致"
-            )
-
-        gov_sum = sum(
-            owners[name][index]
-            for name in OWNERS
-        )
-
-        # 允許官方四捨五入尾差
-        if abs(
-            gov_sum - national
-        ) > Decimal("0.03"):
-
-            raise ValueError(
-                f"{ym} {label}"
-                "中央＋地方＋基金"
-                "與全國差異過大"
-            )
-
-    # ======================================
-    # 6. 產生檢核紀錄
-    # ======================================
+    if problems:
+        raise ValueError(f"{ym} 驗證失敗：" + "；".join(problems))
 
     check = {
         "year": year,
         "month": month,
-        "record_count": len(records),
-        "national_monthly_yi":
-            str(totals["6900"][0]),
-        "national_cumulative_yi":
-            str(totals["6900"][1]),
-        "central_cumulative_yi":
-            str(owners[OWNERS[0]][1]),
-        "local_cumulative_yi":
-            str(owners[OWNERS[1]][1]),
-        "fund_cumulative_yi":
-            str(owners[OWNERS[2]][1]),
+        "national_monthly_yi": to_yi(total("6900")["month"]),
+        "national_cumulative_yi": to_yi(total("6900")["cum"]),
+        "central_cumulative_yi": to_yi(owners["中央政府"]["cum"]),
+        "local_cumulative_yi": to_yi(owners["地方政府(含中央統籌)"]["cum"]),
+        "fund_cumulative_yi": to_yi(owners["撥入中央特種基金"]["cum"]),
         "status": "passed",
     }
 
-    return records, check
+    return check, warnings
 
 
 # ======================================
-# 7. CSV 輸出
+# 6. 單月 → 輸出列
+# ======================================
+
+def budget_version(notes):
+    return "依法定數" if "依法定數" in notes else "原預算數"
+
+
+def parse_month(entry):
+    year = int(entry["year"])
+    month = int(entry["month"])
+    ym = f"{year}{month:02d}"
+
+    files = entry.get("files", {})
+    if set(files) != set(TABLES):
+        raise ValueError(f"{ym} 四表不足或代碼不符：{sorted(files)}")
+
+    tables = {}
+    notes = []
+
+    for code in TABLES:
+        rows, note = parse_table(code, files[code]["path"], year, month)
+        tables[code] = rows
+        notes.append(note)
+
+    check, warnings = check_month(year, month, tables)
+
+    version = budget_version("\n".join(notes))
+    law = "新版(115年起)" if year >= 115 else "舊版"
+
+    records = []
+
+    for code, rows in tables.items():
+        view, _ = TABLES[code]
+
+        for rec in rows:
+            out = {
+                "資料鍵": f"{ym}|{code}|{rec['path']}",
+                "年度": year,
+                "月份": month,
+                "來源表": code,
+                "視角": view,
+                "政府別": rec["gov"],
+                "稅目": rec["name"],
+                "稅目路徑": rec["path"],
+                "父項目": rec["parent_name"],
+                "層級": rec["level"],
+                "列型態": rec["kind"],
+                "計入加總": "TRUE" if rec["include"] else "FALSE",
+                "預算版本": version,
+                "財劃法版本": law,
+                "來源列": rec["src_row"],
+                "新聞網址": entry.get("news_url", ""),
+                "Excel網址": files[code].get("url", ""),
+            }
+            for key, column in YI_FIELDS.items():
+                out[column] = to_yi(rec[key])
+            for key, column in RATE_FIELDS.items():
+                out[column] = rate_text(rec[key])
+            records.append(out)
+
+    check["record_count"] = len(records)
+    check["budget_version"] = version
+
+    return records, check, warnings
+
+
+# ======================================
+# 7. 輸入來源：manifest 或資料夾
+# ======================================
+
+_FILE_PATTERN = re.compile(r"(\d{4})_(\d{3})(\d{2})")
+
+
+def entries_from_dir(folder):
+    """手動備援：掃描資料夾，依檔名中的「表碼_民國年月」分組。"""
+
+    groups = defaultdict(dict)
+
+    for path in sorted(Path(folder).rglob("*.xlsx")):
+        match = _FILE_PATTERN.search(path.name)
+        if not match or match.group(1) not in TABLES:
+            continue
+        code, year, month = match.group(1), int(match.group(2)), int(match.group(3))
+        groups[(year, month)][code] = {"path": str(path), "url": ""}
+
+    return [
+        {
+            "year": y, "month": m, "news_url": "",
+            "files": files, "status": "success",
+        }
+        for (y, m), files in sorted(groups.items())
+    ]
+
+
+def load_entries(manifest_path, from_dir):
+    if from_dir:
+        entries = entries_from_dir(from_dir)
+        if not entries:
+            raise ValueError(f"{from_dir} 裡找不到符合 表碼_年月.xlsx 的檔案")
+        return entries
+
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    entries = manifest.get("months", [])
+    if not entries:
+        raise ValueError("manifest.json 沒有月份資料")
+    return entries
+
+
+# ======================================
+# 8. 輸出
 # ======================================
 
 def write_csv(path, rows):
+    tmp = path.with_name(path.name + ".tmp")
 
-    tmp = path.with_name(
-        path.name + ".tmp"
-    )
-
-    with tmp.open(
-        "w",
-        encoding="utf-8-sig",
-        newline=""
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=COLUMNS
-        )
-
+    with tmp.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=COLUMNS)
         writer.writeheader()
-
-        for record in rows:
-
-            writer.writerow({
-                column: (
-                    ""
-                    if record[column] is None
-                    else str(record[column])
-                )
-                for column in COLUMNS
-            })
+        writer.writerows({c: r.get(c, "") for c in COLUMNS} for r in rows)
 
     tmp.replace(path)
 
 
-# ======================================
-# 8. 全年度整合
-# ======================================
-
-def run(
-    manifest_path="data/manifest.json",
-    output_dir="data"
-):
-
-    manifest_path = Path(
-        manifest_path
+def write_json(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    tmp.replace(path)
 
-    output_dir = Path(
-        output_dir
-    )
 
-    manifest = json.loads(
-        manifest_path.read_text(
-            encoding="utf-8"
-        )
-    )
+def run(manifest_path="data/manifest.json", output_dir="data", from_dir=None):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    year = int(manifest["year"])
+    entries = load_entries(manifest_path, from_dir)
+    entries.sort(key=lambda e: (int(e["year"]), int(e["month"])))
 
-    entries = manifest.get(
-        "months", []
-    )
+    seen = [(int(e["year"]), int(e["month"])) for e in entries]
+    if len(seen) != len(set(seen)):
+        raise ValueError("來源出現重複的年月")
 
-    if not entries:
-        raise ValueError(
-            "manifest.json 沒有月份資料"
-        )
+    all_rows, checks, warnings, errors = [], [], [], []
 
-    months = [
-        int(entry["month"])
-        for entry in entries
-    ]
+    for entry in entries:
+        ym = f"{entry['year']}{int(entry['month']):02d}"
 
-    if len(months) != len(set(months)):
-        raise ValueError(
-            "manifest.json 出現重複月份"
-        )
+        if entry.get("status") != "success":
+            warnings.append(f"{ym} 下載失敗，已略過：{entry.get('error', '')}")
+            continue
 
-    if any(
-        int(entry["year"]) != year
-        for entry in entries
-    ):
-        raise ValueError(
-            "manifest.json 混入其他年度"
-        )
-
-    if sorted(months) != list(
-        range(1, max(months) + 1)
-    ):
-        raise ValueError(
-            f"該年度月份不連續："
-            f"{sorted(months)}"
-        )
-
-    all_rows = []
-    checks = []
-
-    for entry in sorted(
-        entries,
-        key=lambda e: int(e["month"])
-    ):
-
-        records, check = parse_month(
-            entry
-        )
+        try:
+            records, check, warn = parse_month(entry)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
 
         all_rows.extend(records)
         checks.append(check)
+        warnings.extend(warn)
 
         print(
-            f"✓ {year} 年 "
-            f"{check['month']:02d} 月："
-            f"{check['record_count']} 筆，"
-            "全國累計 "
-            f"{check['national_cumulative_yi']}"
-            " 億元"
+            f"✓ {entry['year']} 年 {int(entry['month']):02d} 月："
+            f"{check['record_count']} 筆，全國累計 "
+            f"{check['national_cumulative_yi']} 億元（預算：{check['budget_version']}）"
         )
 
-    # ======================================
-    # 9. 防止重複資料
-    # ======================================
+    # 缺月只警告，不阻擋其他月份
+    by_year = defaultdict(set)
+    for c in checks:
+        by_year[c["year"]].add(c["month"])
+    latest = max(by_year) if by_year else None
+    for year, months in sorted(by_year.items()):
+        expected = max(months) if year == latest else 12
+        missing = sorted(set(range(1, expected + 1)) - months)
+        if missing:
+            warnings.append(f"民國 {year} 年缺少月份：{missing}")
 
-    keys = [
-        row["資料鍵"]
-        for row in all_rows
-    ]
-
+    keys = [r["資料鍵"] for r in all_rows]
     if len(keys) != len(set(keys)):
-        raise ValueError(
-            "資料鍵重複；停止匯出"
-        )
+        errors.append("資料鍵重複")
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    status = "failed" if errors else (
+        "passed_with_warnings" if warnings else "passed"
     )
-
-    # ======================================
-    # 10. 輸出統一資料
-    # ======================================
-
-    csv_path = (
-        output_dir / "tax_records.csv"
-    )
-
-    write_csv(
-        csv_path,
-        all_rows
-    )
-
-    # ======================================
-    # 11. 輸出檢核報告
-    # ======================================
 
     validation = {
-        "year": year,
+        "status": status,
+        "years": sorted(by_year),
         "months": checks,
         "total_records": len(all_rows),
-        "status": "passed",
+        "warnings": warnings,
+        "errors": errors,
     }
+    write_json(output_dir / "validation.json", validation)
 
-    validation_path = (
-        output_dir / "validation.json"
-    )
+    for text in warnings:
+        print("⚠", text)
 
-    tmp = validation_path.with_name(
-        validation_path.name + ".tmp"
-    )
+    if errors:
+        for text in errors:
+            print("✗", text)
+        raise ValueError(f"驗證失敗，共 {len(errors)} 項；未輸出 CSV")
 
-    tmp.write_text(
-        json.dumps(
-            validation,
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding="utf-8"
-    )
+    write_csv(output_dir / "tax_records.csv", all_rows)
 
-    tmp.replace(
-        validation_path
-    )
-
-    print(
-        f"\n全部驗證通過："
-        f"{len(checks)} 個月份，"
-        f"共 {len(all_rows)} 筆"
-    )
-
-    print(
-        f"CSV：{csv_path}"
-    )
-
-    print(
-        f"檢核報告：{validation_path}"
-    )
-
+    print(f"\n完成：{len(checks)} 個月份，共 {len(all_rows)} 筆（{status}）")
     return all_rows
 
 
-# ======================================
-# 12. GitHub Actions 執行入口
-# ======================================
-
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "驗證並整理財政部"
-            "四張月度 Excel"
-        )
-    )
-
+    parser = argparse.ArgumentParser(description="解析並驗證財政部月度賦稅 Excel")
+    parser.add_argument("--manifest", default="data/manifest.json")
+    parser.add_argument("--output", default="data")
     parser.add_argument(
-        "--manifest",
-        default="data/manifest.json"
+        "--from-dir", default=None,
+        help="手動備援：直接掃描此資料夾內的 Excel，不使用 manifest",
     )
-
-    parser.add_argument(
-        "--output",
-        default="data"
-    )
-
     args = parser.parse_args()
 
-    run(
-        manifest_path=args.manifest,
-        output_dir=args.output
-    )
+    try:
+        run(args.manifest, args.output, args.from_dir)
+    except ValueError as exc:
+        print(f"錯誤：{exc}", file=sys.stderr)
+        sys.exit(1)
