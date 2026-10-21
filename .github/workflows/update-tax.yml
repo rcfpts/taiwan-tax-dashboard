@@ -2,18 +2,16 @@
 name: Update Taiwan Tax Revenue
 
 on:
-  # 允許從 GitHub Actions 手動執行
   workflow_dispatch:
 
-  # 每天臺灣時間上午 9:15 執行一次
-  # GitHub Actions cron 使用 UTC
+  # 每天臺灣時間 09:15 自動檢查一次
+  # GitHub Actions 使用 UTC
   schedule:
     - cron: "15 1 * * *"
 
 permissions:
   contents: read
 
-# 避免同時執行兩次更新
 concurrency:
   group: taiwan-tax-update
   cancel-in-progress: false
@@ -21,37 +19,52 @@ concurrency:
 jobs:
   update-tax:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      # 1. 取得 GitHub 專案
+      # 1. 取得 GitHub 程式
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. 設定 Python 3.12
+      # 2. 安裝 Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      # 3. 安裝套件
+      # 3. 安裝必要套件
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. 自動搜尋最新年度及月份
+      # 4. 先執行所有離線測試
+      - name: Run automated tests
+        run: |
+          python -m unittest discover -s tests -v
+
+      # 5. 爬取財政部每月統計
       - name: Download monthly tax Excel
         run: |
           python crawler.py
 
-      # 5. 整理四張表並驗證
+      # 6. 整理資料並驗證
       - name: Process and validate tax data
         run: |
           python processor.py
 
-      # 6. 同步到 Google 試算表
+      # 7. 確認 Google Secrets 已設定
+      - name: Check Google credentials
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          test -n "$GOOGLE_SERVICE_ACCOUNT_JSON" || exit 1
+          test -n "$GOOGLE_SHEET_ID" || exit 1
+          echo "Google credentials are configured."
+
+      # 8. 更新 Google 試算表
       - name: Update Google Sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -59,7 +72,7 @@ jobs:
         run: |
           python update_sheets.py
 
-      # 7. 保留執行結果，方便檢查
+      # 9. 保存執行結果方便檢查
       - name: Upload validation report
         if: always()
         uses: actions/upload-artifact@v4
