@@ -27,6 +27,8 @@ SEARCH_URL = (
 
 KEYWORD = "全國賦稅收入初步統計"
 
+MONTH_RETRY_DELAYS = (2, 5, 10)  # 斷線時依序等待秒數，最多嘗試四次
+
 TABLE_CODES = (
     "6820",  # 全國稅目
     "6900",  # 政府歸屬
@@ -316,13 +318,28 @@ def run(years=None, output_dir="data"):
 
         entry = dict(article)
 
-        try:
-            entry["files"] = download_month(session, article, output_dir)
-            entry["status"] = "success"
-        except Exception as exc:
-            entry["status"] = "failed"
-            entry["error"] = str(exc)
-            print(f"  ✗ {exc}")
+        # 同一月份遇到網路暫時斷線時重試；已下載成功的 XLSX 會沿用。
+        # 重要：不把下載失敗誤寫成「該月份沒有數據」。
+        for attempt in range(1, len(MONTH_RETRY_DELAYS) + 2):
+            try:
+                entry["files"] = download_month(session, article, output_dir)
+                entry["status"] = "success"
+                break
+            except requests.exceptions.RequestException as exc:
+                if attempt > len(MONTH_RETRY_DELAYS):
+                    entry["status"] = "failed"
+                    entry["error"] = str(exc)
+                    print(f"  ✗ 重試後仍下載失敗：{exc}")
+                    break
+                delay = MONTH_RETRY_DELAYS[attempt - 1]
+                print(f"  ⚠ 網路暫時中斷（第 {attempt} 次），{delay} 秒後重試：{exc}")
+                time.sleep(delay)
+            except Exception as exc:
+                # 例如新聞稿已改版、附件缺少：不可當成臨時斷線或正常缺值。
+                entry["status"] = "failed"
+                entry["error"] = str(exc)
+                print(f"  ✗ {exc}")
+                break
 
         results.append(entry)
 
