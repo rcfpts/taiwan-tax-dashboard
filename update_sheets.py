@@ -187,7 +187,8 @@ def _existing_rows(worksheet):
     if header == LEGACY_COLUMNS:
         if any(any(str(v).strip() for v in row) for row in existing[1:]):
             raise ValueError(
-                "偵測到舊版 14 欄資料；為保護歷史紀錄，請先備份／遷移，不能直接覆蓋"
+                "偵測到舊版 14 欄資料（舊版沒有層級與加總標記，內含重複計算的房地合一）。"
+                "請先把該工作表複製一份備份，再清空原工作表整頁後重新執行"
             )
         return []
 
@@ -281,13 +282,23 @@ def sync(worksheet, rows, require_current_contiguous=True):
     return len(merged)
 
 
+def contiguous_required():
+    """預設要求最新年度 1 月到最新月份不可缺月。
+
+    財政部若確定某個月不會補發，可設定環境變數 ALLOW_MISSING_MONTHS=1 放行，
+    否則缺的那個月會讓所有更新永遠停住。
+    """
+
+    return os.environ.get("ALLOW_MISSING_MONTHS") != "1"
+
+
 def main():
     rows = load_verified_data()
 
     spreadsheet = open_spreadsheet()
     worksheet = get_or_create_worksheet(spreadsheet)
 
-    count = sync(worksheet, rows)
+    count = sync(worksheet, rows, require_current_contiguous=contiguous_required())
 
     print(f"完成：寫入 {count} 筆到「{WORKSHEET_NAME}」")
     print(f"https://docs.google.com/spreadsheets/d/{spreadsheet.id}/edit")
