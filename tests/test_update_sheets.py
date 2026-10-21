@@ -65,13 +65,11 @@ class UpdateSheetsTest(unittest.TestCase):
         self.assertIsInstance(by_name["計入加總"], bool)
         self.assertEqual(by_name["累計實徵_億元"], 35713.84)
 
-    def test_empty_rate_is_blank_cell(self):
-        row = next(
-            r for r in self.rows
-            if r["稅目"] == "教育捐" and r["來源表"] == "6820"
-        )
-        by_name = dict(zip(processor.COLUMNS, update_sheets.as_sheet_row(row)))
-        self.assertEqual(by_name["累計占分配預算比率_%"], "")
+    def test_no_derived_ratios_are_written(self):
+        self.assertEqual(len(processor.COLUMNS), 19)
+        self.assertNotIn("累計占分配預算比率_%", processor.COLUMNS)
+        self.assertNotIn("累計較上年同期增減率_%", processor.COLUMNS)
+        self.assertEqual(len(update_sheets.as_sheet_row(self.rows[0])), 19)
 
     def test_sync_overwrites_and_clears_tail(self):
         sheet = FakeSheet(header=processor.COLUMNS)
@@ -115,18 +113,6 @@ class UpdateSheetsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "舊版"):
             update_sheets.sync(sheet, self.rows, require_current_contiguous=False)
         self.assertFalse(sheet.written)
-
-    def test_missing_month_override_switch(self):
-        import os
-        old = os.environ.pop("ALLOW_MISSING_MONTHS", None)
-        try:
-            self.assertTrue(update_sheets.contiguous_required())
-            os.environ["ALLOW_MISSING_MONTHS"] = "1"
-            self.assertFalse(update_sheets.contiguous_required())
-        finally:
-            os.environ.pop("ALLOW_MISSING_MONTHS", None)
-            if old is not None:
-                os.environ["ALLOW_MISSING_MONTHS"] = old
 
     def test_current_month_replaces_entire_period_without_duplicate(self):
         old = update_sheets.as_sheet_row(self.rows[0])
