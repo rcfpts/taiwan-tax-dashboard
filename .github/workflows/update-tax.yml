@@ -1,11 +1,9 @@
-
 name: Update Taiwan Tax Revenue
 
 on:
   workflow_dispatch:
 
-  # 每天臺灣時間 09:15 自動檢查一次
-  # GitHub Actions 使用 UTC
+  # 每天臺灣時間 09:15 自動檢查一次（GitHub Actions 使用 UTC）
   schedule:
     - cron: "15 1 * * *"
 
@@ -64,7 +62,7 @@ jobs:
           test -n "$GOOGLE_SHEET_ID" || exit 1
           echo "Google credentials are configured."
 
-      # 8. 更新 Google 試算表
+      # 8. 更新原本的稅收原始資料
       - name: Update Google Sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -72,7 +70,20 @@ jobs:
         run: |
           python update_sheets.py
 
-      # 9. 保存執行結果方便檢查
+      # 9. 擷取每月新聞稿的官方累計分配預算達成率
+      - name: Extract news metrics
+        run: |
+          python news_metrics.py
+
+      # 10. 更新獨立的新聞稿月度指標工作表
+      - name: Update news metrics
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          python update_news_metrics.py
+
+      # 11. 保存驗證報告，方便查詢執行結果
       - name: Upload validation report
         if: always()
         uses: actions/upload-artifact@v4
@@ -81,5 +92,6 @@ jobs:
           path: |
             data/manifest.json
             data/validation.json
+            data/news_metrics_validation.json
           retention-days: 14
           if-no-files-found: ignore
