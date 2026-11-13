@@ -36,6 +36,24 @@ class NewsMetricsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '找不到'):
             news_metrics.extract_allocated_ratio(html, 115, 9)
 
+    def test_october_official_only_annual_ratio_means_no_forecast(self):
+        html = (
+            '<html><body><p>三、達成率：累計1至10月實徵淨額'
+            '占全年預算數91.4%。</p></body></html>'
+        )
+        self.assertIsNone(news_metrics.extract_allocated_ratio(html, 115, 10))
+        rows = []
+        for month in range(1, 11):
+            ratio = None if month in (1, 10) else Decimal("115.0")
+            r = news_metrics.make_metric(
+                115, month, "41383.00", "45298.76", "依法定數",
+                "https://www.mof.gov.tw/news", ratio,
+            )
+            rows.append(r)
+        self.assertTrue(news_metrics.validate_metrics(rows))
+        self.assertEqual(rows[-1]["資料類型"], "未估")
+        self.assertEqual(rows[-1]["預估超徵短徵_億元"], "")
+
     def test_january_no_ratio(self):
         self.assertIsNone(news_metrics.extract_allocated_ratio(JAN, 115, 1))
         r = news_metrics.make_metric(115, 1, '2643.70', '40000', '原預算數',
