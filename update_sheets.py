@@ -215,6 +215,13 @@ def _existing_rows(worksheet):
     return records
 
 
+def _sort_key(record):
+    return (
+        int(record["年度"]), int(record["月份"]),
+        str(record["來源表"]), str(record["稅目路徑"]),
+    )
+
+
 def sync(worksheet, rows, require_current_contiguous=True):
     """整月更新收到的年月、保留其他歷年資料，不會誤刪舊年度。"""
     existing = _existing_rows(worksheet)
@@ -246,11 +253,19 @@ def sync(worksheet, rows, require_current_contiguous=True):
             )
 
     # 轉型在觸碰工作表之前全部完成。
-    merged.sort(key=lambda r: (
-        int(r["年度"]), int(r["月份"]), str(r["來源表"]), str(r["稅目路徑"])
-    ))
+    merged.sort(key=_sort_key)
     values = [COLUMNS] + [as_sheet_row(r) for r in merged]
     last_col = column_letter(len(COLUMNS))
+
+    # 內容和試算表完全相同就不必寫入（每天排程大多數時候資料都沒變）。
+    # 只比對 A～S 欄；任何型態或內容有差異都會照原本流程重寫，所以出錯時
+    # 最壞情況就是和以前一樣多寫一次。
+    current = [COLUMNS] + [
+        [record[c] for c in COLUMNS] for record in sorted(existing, key=_sort_key)
+    ]
+    if current == values:
+        print(f"試算表內容與本次資料相同，略過寫入（{len(merged)} 筆）")
+        return len(merged)
 
     needed_rows = len(values) + 20
     if worksheet.row_count < needed_rows or worksheet.col_count < len(COLUMNS):
