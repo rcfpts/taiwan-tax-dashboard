@@ -72,6 +72,14 @@ def extract_allocated_ratio(html, year, month):
     if not ratio:
         if month == 1:
             return None
+        # 部分年末月份（例如 115/10）新聞稿只提供「占全年預算」；
+        # 這不是老師指定的「占累計分配預算」比率，應記為無預估。
+        # 僅在明確看到全年達成率時接受缺值；其他格式異常仍報錯。
+        if month in (10, 11) and re.search(
+            r"占\s*全年\s*預算\s*數?\s*[0-9]+(?:\.[0-9]+)?\s*%",
+            section,
+        ):
+            return None
         raise ValueError(f"{year}/{month:02d} 找不到『占累計分配預算數』的百分比")
     period = PERIOD_PATTERN.search(section[:ratio.start()])
     if period and int(period.group(1)) != month:
@@ -196,7 +204,18 @@ def validate_metrics(rows):
     for r in rows:
         month = int(r["月份"])
         if 2 <= month <= 11 and r["資料類型"] != "全年推估":
-            raise ValueError(f"{r['年度']}/{month:02d} 缺少官方達成率，不可發佈")
+            # 10、11 月如新聞稿明確沒有累計分配預算達成率，顯示「無」，
+            # 不得把「占全年預算」替代為超徵預測值。
+            missing_by_official_source = (
+                month in (10, 11)
+                and r["資料類型"] == "未估"
+                and r["資料狀態"] == "官方未公布比率"
+                and not r["官方累計分配預算達成率_%"]
+                and not r["預估超徵短徵_億元"]
+                and not r["預估全年實徵_億元"]
+            )
+            if not missing_by_official_source:
+                raise ValueError(f"{r['年度']}/{month:02d} 缺少官方達成率，不可發佈")
         if month == 12 and r["資料類型"] != "全年初步實際":
             raise ValueError("12 月須列全年初步實際，不能當預估")
     return True
