@@ -214,6 +214,22 @@ def sync(worksheet, incoming):
         to_sheet_row(r) for r in merged
     ]
 
+    # 內容和試算表完全相同就略過寫入；有任何差異則照原流程重寫。
+    current = [COLUMNS] + [
+        [record[c] for c in COLUMNS]
+        for record in sorted(
+            existing,
+            key=lambda r: (int(r["年度"]), int(r["月份"])),
+        )
+    ]
+
+    if current == values:
+        print(
+            f"新聞稿月度指標：內容與試算表相同，略過寫入"
+            f"（{len(merged)} 月）"
+        )
+        return len(merged)
+
     need_rows = len(values) + 20
 
     if (
