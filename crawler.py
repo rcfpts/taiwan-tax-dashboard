@@ -14,6 +14,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ======================================
@@ -46,9 +47,22 @@ TITLE_PATTERN = re.compile(
 # SSL 相容性
 # ======================================
 
+# 所有請求（搜尋頁、列表頁、新聞稿、Excel）共用的自動重試。
+# 搜尋表單用 POST，但只是查詢、重送不會改變任何資料，所以 POST 也可以重試。
+HTTP_RETRY = Retry(
+    total=3,
+    backoff_factor=1.5,  # 依序等待約 0、3、6 秒
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset({"GET", "POST"}),
+    respect_retry_after_header=True,
+)
+
+
 class MOFSSLAdapter(HTTPAdapter):
 
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault("max_retries", HTTP_RETRY)
+
         self.ssl_context = ssl.create_default_context()
 
         if hasattr(ssl, "VERIFY_X509_STRICT"):
