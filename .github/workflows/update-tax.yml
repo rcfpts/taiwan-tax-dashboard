@@ -8,7 +8,8 @@ on:
     - cron: "15 1 * * *"
 
 permissions:
-  contents: read
+  # 只用來提交 status/last_run.json（讓排程不會因 60 天沒活動被停用）
+  contents: write
 
 concurrency:
   group: taiwan-tax-update
@@ -42,6 +43,8 @@ jobs:
         run: |
           python -m unittest discover -s tests -v
 
+      # ── 第一階段：取得資料並全部驗證（此階段完全不寫試算表）──
+
       # 5. 爬取財政部每月統計
       - name: Download monthly tax Excel
         run: |
@@ -52,7 +55,12 @@ jobs:
         run: |
           python processor.py
 
-      # 7. 確認 Google Secrets 已設定
+      # 7. 擷取每月新聞稿的官方累計分配預算達成率
+      - name: Extract news metrics
+        run: |
+          python news_metrics.py
+
+      # 8. 確認 Google Secrets 已設定
       - name: Check Google credentials
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -62,7 +70,9 @@ jobs:
           test -n "$GOOGLE_SHEET_ID" || exit 1
           echo "Google credentials are configured."
 
-      # 8. 更新原本的稅收原始資料
+      # ── 第二階段：兩份資料都驗證通過後，才一起寫入試算表 ──
+
+      # 9. 更新原本的稅收原始資料（內容沒變會自動略過）
       - name: Update Google Sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -70,12 +80,7 @@ jobs:
         run: |
           python update_sheets.py
 
-      # 9. 擷取每月新聞稿的官方累計分配預算達成率
-      - name: Extract news metrics
-        run: |
-          python news_metrics.py
-
-      # 10. 更新獨立的新聞稿月度指標工作表
+      # 10. 更新獨立的新聞稿月度指標工作表（內容沒變會自動略過）
       - name: Update news metrics
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -83,7 +88,30 @@ jobs:
         run: |
           python update_news_metrics.py
 
-      # 11. 保存驗證報告，方便查詢執行結果
+      # 11. 記錄執行狀態並提交，避免公開 repo 因 60 天沒活動而停用排程。
+      #     內容一個月內不會變，所以大約每月才有一次 commit。
+      #     這一步失敗（例如分支有保護規則）不影響資料更新。
+      - name: Record run status
+        continue-on-error: true
+        run: |
+          python health.py status --output status/last_run.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add status/last_run.json
+          if git diff --cached --quiet; then
+            echo "狀態沒有變化，不需要提交。"
+          else
+            git commit -m "Update run status"
+            git push
+          fi
+
+      # 12. 資料是否過期：放在寫入之後，這樣即使資料落後，
+      #     已取得的月份仍會先更新，但 workflow 會標示失敗並通知。
+      - name: Check data freshness
+        run: |
+          python health.py check
+
+      # 13. 保存驗證報告，方便查詢執行結果
       - name: Upload validation report
         if: always()
         uses: actions/upload-artifact@v4
