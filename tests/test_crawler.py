@@ -64,6 +64,24 @@ class CrawlerTest(unittest.TestCase):
             6: results_page([(113, 8)]),
         }
 
+    def test_new_title_without_quanguo_still_recognized(self):
+        html = (
+            '<table class="table-list"><tbody>'
+            '<tr><td><a href="/new">115年10月賦稅收入初步統計</a></td></tr>'
+            '<tr><td><a href="/old">115年9月全國賦稅收入初步統計</a></td></tr>'
+            '</tbody></table>'
+        )
+        articles = crawler.parse_news_results(html)
+        self.assertEqual([(a["year"], a["month"]) for a in articles],
+                         [(115, 10), (115, 9)])
+
+    def test_search_keyword_matches_both_title_versions(self):
+        self.assertEqual(crawler.KEYWORD, "賦稅收入初步統計")
+        self.assertIn(crawler.KEYWORD, "115年10月賦稅收入初步統計")
+        self.assertIn(crawler.KEYWORD, "115年9月全國賦稅收入初步統計")
+        form = dict(crawler.build_search_form(FORM, 1))
+        self.assertEqual(form["title"], crawler.KEYWORD)
+
     def test_default_fetches_latest_year_and_previous_year(self):
         session = FakeSession(self.pages)
         articles = crawler.find_articles(session)
